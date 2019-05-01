@@ -73,10 +73,10 @@ struct tlv2553 {
 					| BIT(IIO_CHAN_INFO_OFFSET),	\
 		.scan_index = chan,					\
 		.scan_type = {						\
-			.sign = 's',					\
-			.realbits = 13,					\
+			.sign = 'u',					\
+			.realbits = 12,					\
 			.storagebits = 16,				\
-			.shift = 3,					\
+			.shift = 4,					\
 			.endianness = IIO_BE,				\
 		},							\
 	}
@@ -93,7 +93,10 @@ static const struct iio_chan_spec tlv2553_channels[] = {
 	TLV2553_VOLTAGE_CHANNEL(8),
 	TLV2553_VOLTAGE_CHANNEL(9),
 	TLV2553_VOLTAGE_CHANNEL(10),
-	IIO_CHAN_SOFT_TIMESTAMP(11),
+	TLV2553_VOLTAGE_CHANNEL(11),
+	TLV2553_VOLTAGE_CHANNEL(12),
+	TLV2553_VOLTAGE_CHANNEL(13),
+	IIO_CHAN_SOFT_TIMESTAMP(14),
 };
 
 static int tlv2553_wait_eoc(struct tlv2553 *tlvdata, unsigned long timeout)
@@ -116,6 +119,8 @@ static int tlv2553_read_adc(struct tlv2553 *tlvdata, u8 cmd, u16 *value)
 	rx_buf[0] = 0;
 	rx_buf[1] = 0;
 
+	reinit_completion(&tlvdata->complete);
+	
 	ret = spi_write(spi, tx_buf, 2);
 	if (ret) {
 		dev_err(&spi->dev, "tlv2553_read_adc: spi_write failed\n");
@@ -157,10 +162,59 @@ static void tlv2553_dump_registers(struct tlv2553 *tlvdata)
 	printk("    Test V_REF+              : 0x%03x\n", values[0xD]);
 }
 
-static int tlv2553_read_raw(struct iio_dev *iio,
+static int tlv2553_read_raw(struct iio_dev *indio_dev,
 			     struct iio_chan_spec const *channel, int *value,
 			     int *shift, long mask)
 {
+	struct tlv2553 *tlvdata = iio_priv(indio_dev);
+	int ret;
+	u16 data;
+
+	switch (mask) {
+	case IIO_CHAN_INFO_RAW:
+		mutex_lock(&tlvdata->lock);
+		ret = tlv2553_read_adc(tlvdata, channel->channel, &data);
+		mutex_unlock(&tlvdata->lock);
+		if (ret)
+			return ret;
+
+		//printk("tlv2553_read_adc %d : 0x%03x (%u)\n", channel->channel, data, data);
+		*value = data;
+		
+		return IIO_VAL_INT;
+	case IIO_CHAN_INFO_SCALE:
+		ret = regulator_get_voltage(tlvdata->vref_p);
+		if (ret < 0)
+			return ret;
+		*value = ret;
+
+		if (!IS_ERR(tlvdata->vref_n)) {
+			ret = regulator_get_voltage(tlvdata->vref_n);
+			if (ret < 0)
+				return ret;
+			*value -= ret;
+		}
+
+		/* convert regulator output voltage to mV */
+		*value /= 1000;
+		*shift = channel->scan_type.realbits - 1;
+
+		return IIO_VAL_FRACTIONAL_LOG2;
+	case IIO_CHAN_INFO_OFFSET:
+		if (!IS_ERR(tlvdata->vref_n)) {
+			*value = regulator_get_voltage(tlvdata->vref_n);
+			if (*value < 0)
+				return *value;
+		} else {
+			*value = 0;
+		}
+
+		/* convert regulator output voltage to mV */
+		*value /= 1000;
+
+		return IIO_VAL_INT;
+	}
+
 	return -EINVAL;
 }
 
@@ -169,7 +223,6 @@ static irqreturn_t tlv2553_eoc_handler(int irq, void *p)
   	struct iio_dev *indio_dev = p;
 	struct tlv2553 *tlvdata = iio_priv(indio_dev);
 
-//	printk("tlv2553_eoc_handler\n");
 	complete(&tlvdata->complete);
 
 	return IRQ_HANDLED;
@@ -180,6 +233,19 @@ static const struct iio_info tlv2553_info = {
 	.driver_module = THIS_MODULE,
 };
 
+static int tlv2553_init(struct tlv2553 *tlvdata)
+{
+	int ret;
+	u16 value;
+	
+	reinit_completion(&tlvdata->complete);
+	ret = tlv2553_read_adc(tlvdata, SELECT_ADC_REF_POS, &value);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
 static int tlv2553_probe(struct spi_device *spi)
 {
 	struct iio_dev *indio_dev;
@@ -187,8 +253,6 @@ static int tlv2553_probe(struct spi_device *spi)
 	struct tlv2553 *tlvdata;
 	int ret;
 	u16 value = 0;
-
-	printk("tlv2553_probe\n");
 
 	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*tlvdata));
 	if (!indio_dev) {
@@ -201,6 +265,28 @@ static int tlv2553_probe(struct spi_device *spi)
 	tlvdata->id = spi_get_device_id(spi)->driver_data;
 	mutex_init(&tlvdata->lock);
 	init_completion(&tlvdata->complete);
+
+	indio_dev->name = spi_get_device_id(spi)->name;
+	indio_dev->dev.parent = &spi->dev;
+	indio_dev->info = &tlv2553_info;
+	indio_dev->modes = INDIO_DIRECT_MODE;
+	indio_dev->channels = tlv2553_channels;
+	indio_dev->num_channels = ARRAY_SIZE(tlv2553_channels);
+
+	tlvdata->vref_p = devm_regulator_get(&spi->dev, "vref-p");
+	if (IS_ERR(tlvdata->vref_p))
+		return PTR_ERR(tlvdata->vref_p);
+
+	tlvdata->vref_n = devm_regulator_get_optional(&spi->dev, "vref-n");
+	if (IS_ERR(tlvdata->vref_n)) {
+		/*
+		 * Assume vref_n is 0V if an optional regulator is not
+		 * specified, otherwise return the error code.
+		 */
+		ret = PTR_ERR(tlvdata->vref_n);
+		if (ret != -ENODEV)
+			return ret;
+	}
 
 	irq_flags = irq_get_trigger_type(spi->irq);
 	if (irq_flags != IRQF_TRIGGER_RISING) {
@@ -215,47 +301,46 @@ static int tlv2553_probe(struct spi_device *spi)
 		return ret;
 	}
 
+	ret = regulator_enable(tlvdata->vref_p);
+	if (ret)
+		return ret;
+
+	if (!IS_ERR(tlvdata->vref_n)) {
+		ret = regulator_enable(tlvdata->vref_n);
+		if (ret)
+			goto err_vref_p_disable;
+	}
+
+	ret = tlv2553_init(tlvdata);
+	if (ret)
+		goto err_vref_n_disable;
+
 	spi_set_drvdata(spi, indio_dev);
 
-#if 0
-	/* Test that we can read the expected value from V_REF+ (0xFFF) */
-	ret = tlv2553_read_adc(tlvdata, SELECT_ADC_REF_POS, &value);
-	if (ret) {
-		dev_err(&spi->dev, "Unable to read from ADC\n");
-		return ret;
-	}
-
-	if (value != 0xFFF) {
-		dev_err(&spi->dev, "Unexpected response from V_REF+ test, got 0x%x\n", value);
-		return -EINVAL;
-	}
-
-	/* Test that we can read the expected value from V_REF- (0) */
-	ret = tlv2553_read_adc(tlvdata, SELECT_ADC_REF_NEG, &value);
-	if (ret) {
-		dev_err(&spi->dev, "Unable to read from ADC\n");
-		return ret;
-	}
-
-	if (value != 0) {
-		dev_err(&spi->dev, "Unexpected response from V_REF- test, got 0x%x\n", value);
-		return -EINVAL;
-	}
-#endif
-	
-	tlv2553_dump_registers(tlvdata);
+	ret = iio_device_register(indio_dev);
+	if (ret)
+		goto err_vref_n_disable;
 
 	return 0;
+
+err_vref_n_disable:
+	if (!IS_ERR(tlvdata->vref_n))
+		regulator_disable(tlvdata->vref_n);
+err_vref_p_disable:
+	regulator_disable(tlvdata->vref_p);
+	return ret;
 }
 
 static int tlv2553_remove(struct spi_device *spi)
 {
   	struct iio_dev *indio_dev = spi_get_drvdata(spi);
-	//struct tlv2553 *tlvdata = iio_priv(indio_dev);
+	struct tlv2553 *tlvdata = iio_priv(indio_dev);
 
-	printk("tlv2553_remove\n");
-	
-	//	devm_iio_device_free(indio_dev);
+	iio_device_unregister(indio_dev);
+	if (!IS_ERR(tlvdata->vref_n))
+		regulator_disable(tlvdata->vref_n);
+	regulator_disable(tlvdata->vref_p);
+	devm_iio_device_free(&spi->dev, indio_dev);
 
 	return 0;
 }
