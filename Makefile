@@ -6,4 +6,4 @@ all:
 	make -C ${KERNEL_SOURCE} M=$(PWD) modules
 
 clean:
-	${MAKE} -C ${KERNEL_SOURCE} M=$(PWD) clean
+	make -C ${KERNEL_SOURCE} M=$(PWD) clean
